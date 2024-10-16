@@ -7,6 +7,12 @@ import cors from 'cors';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
+import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
+import dotenv from 'dotenv';
+
+// Load environment variables from .env file
+dotenv.config();
 
 // Define Interfaces for Type Safety
 interface Restaurant {
@@ -37,8 +43,17 @@ interface Review {
     date?: string;
 }
 
+interface User {
+    id?: number;
+    username: string;
+    password: string;
+    created_at?: string;
+}
+
 const app = express();
 const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || 'your_super_secret_jwt_key'; // Replace with a secure key
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
 
 // Declare the database variable with the correct type from 'sqlite'
 let db: Database<sqlite3.Database, sqlite3.Statement>;
@@ -92,6 +107,16 @@ async function initDb() {
         )
     `);
 
+    // Create Users Table
+    await db.run(`
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            password TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    `);
+
     console.log('Connected to the SQLite database and tables are set up.');
 }
 
@@ -137,12 +162,36 @@ app.use(express.json());
 // Serve static files from the uploads directory
 app.use('/uploads', express.static(uploadDir));
 
-// Optional: Enable CORS if your frontend is hosted separately
+// Enable CORS
 app.use(cors({
-    origin: 'http://your-frontend-domain.com', // Replace with your frontend URL
+    origin: FRONTEND_URL, // Replace with your frontend URL
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
     credentials: true
 }));
+
+// Authentication Middleware
+interface AuthenticatedRequest extends Request {
+    user?: { id: number; username: string };
+}
+
+const authenticateJWT = (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    const authHeader = req.headers.authorization;
+
+    if (authHeader) {
+        const token = authHeader.split(' ')[1];
+
+        jwt.verify(token, JWT_SECRET, (err, user) => {
+            if (err) {
+                return res.sendStatus(403); // Forbidden
+            }
+
+            req.user = user as { id: number; username: string };
+            next();
+        });
+    } else {
+        res.sendStatus(401); // Unauthorized
+    }
+};
 
 // Async Handler to Catch Errors in Async Routes
 const asyncHandler = (fn: Function) => (req: Request, res: Response, next: NextFunction) => {
@@ -150,11 +199,78 @@ const asyncHandler = (fn: Function) => (req: Request, res: Response, next: NextF
 };
 
 // -----------------------
+// Authentication Routes
+// -----------------------
+
+// Register a new user
+app.post('/register', asyncHandler(async (req: Request, res: Response) => {
+    const { username, password } = req.body as User;
+
+    if (!username || !password) {
+        return res.status(400).json({ error: 'Username and password are required.' });
+    }
+
+    // Check if username already exists
+    const existingUser = await db.get('SELECT * FROM users WHERE username = ?', [username]);
+    if (existingUser) {
+        return res.status(409).json({ error: 'Username already exists.' }); // Conflict
+    }
+
+    // Hash the password
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    // Insert the new user into the database
+    const result = await db.run(
+        'INSERT INTO users (username, password) VALUES (?, ?)',
+        [username, hashedPassword]
+    );
+
+    const newUser: Partial<User> = {
+        id: result.lastID,
+        username
+    };
+
+    res.status(201).json({ message: 'User registered successfully.', user: newUser });
+}));
+
+// Login a user
+app.post('/login', asyncHandler(async (req: Request, res: Response) => {
+    const { username, password } = req.body as User;
+
+    if (!username || !password) {
+        return res.status(400).json({ error: 'Username and password are required.' });
+    }
+
+    // Retrieve the user from the database
+    const user = await db.get('SELECT * FROM users WHERE username = ?', [username]);
+
+    if (!user) {
+        return res.status(401).json({ error: 'Invalid credentials.' }); // Unauthorized
+    }
+
+    // Compare the provided password with the hashed password
+    const passwordMatch = await bcrypt.compare(password, user.password);
+
+    if (!passwordMatch) {
+        return res.status(401).json({ error: 'Invalid credentials.' }); // Unauthorized
+    }
+
+    // Generate a JWT
+    const token = jwt.sign(
+        { id: user.id, username: user.username },
+        JWT_SECRET,
+        { expiresIn: '1h' } // Token expires in 1 hour
+    );
+
+    res.json({ message: 'Login successful.', token });
+}));
+
+// -----------------------
 // Restaurants Routes
 // -----------------------
 
-// Create a new restaurant
-app.post('/restaurants', asyncHandler(async (req: Request, res: Response) => {
+// Create a new restaurant (Protected)
+app.post('/restaurants', authenticateJWT, asyncHandler(async (req: Request, res: Response) => {
     const { name, location } = req.body as Restaurant;
 
     if (!name) {
@@ -193,8 +309,8 @@ app.get('/restaurants/:id', asyncHandler(async (req: Request, res: Response) => 
     res.json(restaurant);
 }));
 
-// Update a restaurant by ID
-app.put('/restaurants/:id', asyncHandler(async (req: Request, res: Response) => {
+// Update a restaurant by ID (Protected)
+app.put('/restaurants/:id', authenticateJWT, asyncHandler(async (req: Request, res: Response) => {
     const { id } = req.params;
     const { name, location } = req.body as Restaurant;
 
@@ -221,8 +337,8 @@ app.put('/restaurants/:id', asyncHandler(async (req: Request, res: Response) => 
     res.json(updatedRestaurant);
 }));
 
-// Delete a restaurant by ID
-app.delete('/restaurants/:id', asyncHandler(async (req: Request, res: Response) => {
+// Delete a restaurant by ID (Protected)
+app.delete('/restaurants/:id', authenticateJWT, asyncHandler(async (req: Request, res: Response) => {
     const { id } = req.params;
 
     const restaurant = await db.get('SELECT * FROM restaurants WHERE id = ?', [id]);
@@ -240,8 +356,8 @@ app.delete('/restaurants/:id', asyncHandler(async (req: Request, res: Response) 
 // Food Items Routes
 // -----------------------
 
-// Create a new food item with optional image
-app.post('/food-items', upload.single('image'), asyncHandler(async (req: Request, res: Response) => {
+// Create a new food item with optional image (Protected)
+app.post('/food-items', authenticateJWT, upload.single('image'), asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
     const { name, description, price, restaurant_id } = req.body as FoodItem;
 
     if (!name || !restaurant_id) {
@@ -299,8 +415,8 @@ app.get('/food-items/:id', asyncHandler(async (req: Request, res: Response) => {
     res.json(foodItem);
 }));
 
-// Update a food item by ID with optional image
-app.put('/food-items/:id', upload.single('image'), asyncHandler(async (req: Request, res: Response) => {
+// Update a food item by ID with optional image (Protected)
+app.put('/food-items/:id', authenticateJWT, upload.single('image'), asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
     const { id } = req.params;
     const { name, description, price, restaurant_id } = req.body as FoodItem;
 
@@ -360,8 +476,8 @@ app.put('/food-items/:id', upload.single('image'), asyncHandler(async (req: Requ
     res.json(updatedFoodItem);
 }));
 
-// Delete a food item by ID
-app.delete('/food-items/:id', asyncHandler(async (req: Request, res: Response) => {
+// Delete a food item by ID (Protected)
+app.delete('/food-items/:id', authenticateJWT, asyncHandler(async (req: Request, res: Response) => {
     const { id } = req.params;
 
     const foodItem = await db.get('SELECT * FROM food_items WHERE id = ?', [id]);
@@ -387,8 +503,8 @@ app.delete('/food-items/:id', asyncHandler(async (req: Request, res: Response) =
 // Reviews Routes
 // -----------------------
 
-// Create a new review with optional image
-app.post('/reviews', upload.single('image'), asyncHandler(async (req: Request, res: Response) => {
+// Create a new review with optional image (Protected)
+app.post('/reviews', authenticateJWT, upload.single('image'), asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
     const { food_item_id, rating, comment } = req.body as Review;
 
     if (!food_item_id || !rating) {
@@ -453,8 +569,8 @@ app.get('/reviews/:id', asyncHandler(async (req: Request, res: Response) => {
     res.json(review);
 }));
 
-// Update a review by ID with optional image
-app.put('/reviews/:id', upload.single('image'), asyncHandler(async (req: Request, res: Response) => {
+// Update a review by ID with optional image (Protected)
+app.put('/reviews/:id', authenticateJWT, upload.single('image'), asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
     const { id } = req.params;
     const { food_item_id, rating, comment } = req.body as Review;
 
@@ -520,8 +636,8 @@ app.put('/reviews/:id', upload.single('image'), asyncHandler(async (req: Request
     res.json(updatedReview);
 }));
 
-// Delete a review by ID
-app.delete('/reviews/:id', asyncHandler(async (req: Request, res: Response) => {
+// Delete a review by ID (Protected)
+app.delete('/reviews/:id', authenticateJWT, asyncHandler(async (req: Request, res: Response) => {
     const { id } = req.params;
 
     const review = await db.get('SELECT * FROM reviews WHERE id = ?', [id]);
