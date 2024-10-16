@@ -1,5 +1,3 @@
-// src/server.ts
-
 import express, { Request, Response, NextFunction } from 'express';
 import sqlite3 from 'sqlite3';
 import { open, Database } from 'sqlite';
